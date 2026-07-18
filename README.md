@@ -2,13 +2,19 @@
 
 Решение задачи ранжирования обращений по вероятности успешного целевого действия в течение 5 дней после назначения.
 
-Основная модель — `CatBoostClassifier`. В решении используются готовые табличные признаки, исторические события из `events.csv`, временная валидация и подбор гиперпараметров через Optuna.
+Основная модель — `CatBoostClassifier`. В решении используются готовые табличные признаки, исторические события из `events.csv`, расширенные временные признаки, trend-признаки и funnel-признаки.
+
+Финальный результат сохраняется в файл:
+
+```text
+submission_enhanced.csv
+```
 
 ## Постановка задачи
 
-Для каждого обращения из `test.csv` требуется предсказать `score` — вероятность успешного целевого действия.
+Для каждого обращения из `test.csv` требуется предсказать `score`, отражающий перспективность обращения.
 
-Чем выше `score`, тем перспективнее обращение и тем выше оно должно находиться в ранжировании.
+Чем выше `score`, тем выше обращение должно находиться в ранжировании.
 
 Целевая переменная:
 
@@ -25,13 +31,25 @@ lead_id,score
 
 Основная метрика — **Daily Average Precision**.
 
-Average Precision считается отдельно для каждого дня назначения обращения, после чего значения усредняются по дням:
+Average Precision рассчитывается отдельно для каждого дня назначения обращения, после чего полученные значения усредняются:
 
 ```text
 Daily AP = mean(AP для каждого assignment_date)
 ```
 
-В локальной проверке используется именно эта схема, а не один общий Average Precision по всей валидационной выборке.
+Таким образом, важен порядок объектов внутри каждого отдельного дня, а не только глобальный порядок по всей тестовой выборке.
+
+В коде присутствует функция:
+
+```python
+daily_average_precision(...)
+```
+
+Она:
+
+1. группирует строки по `assignment_date`;
+2. рассчитывает Average Precision внутри каждого дня;
+3. возвращает среднее значение по всем дням.
 
 ## Структура проекта
 
@@ -42,60 +60,112 @@ project/
 │   ├── test.csv
 │   └── events.csv
 ├── corrected_lead_solution.ipynb
-├── corrected_lead_solution.py
 ├── README.md
-└── submissions/
+├── requirements.txt
+└── submission_enhanced.csv
 ```
 
-Файлы submission могут сохраняться в корне проекта или в отдельной папке.
+Файл `submission_enhanced.csv` создаётся после выполнения финальной ячейки ноутбука.
 
-## Используемые библиотеки
+Файл `sample_submission.csv` для запуска решения не требуется.
+
+## Установка зависимостей
+
+Рекомендуемая версия Python — 3.10 или новее.
+
+Установка зависимостей:
 
 ```bash
-pip install pandas numpy scikit-learn catboost optuna
+pip install numpy pandas scikit-learn catboost jupyter
 ```
 
-Рекомендуемая версия Python: 3.10 или новее.
+Либо через `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+```
+
+Содержимое `requirements.txt`:
+
+```text
+numpy
+pandas
+scikit-learn
+catboost
+jupyter
+```
 
 ## Общая схема решения
 
-### 1. Загрузка и подготовка данных
+### 1. Загрузка данных
 
-Временные поля приводятся к типу `datetime`.
+Из папки `data` загружаются:
+
+```text
+train.csv
+test.csv
+events.csv
+```
+
+Временные поля преобразуются в `datetime`:
+
+```python
+frame["assignment_ts"] = pd.to_datetime(
+    frame["assignment_ts"],
+    errors="raise",
+)
+
+frame["assignment_date"] = pd.to_datetime(
+    frame["assignment_date"],
+    errors="raise",
+).dt.normalize()
+```
 
 Обучающая выборка сортируется по времени назначения:
 
 ```python
-train["assignment_ts"] = pd.to_datetime(train["assignment_ts"])
-train["assignment_date"] = pd.to_datetime(train["assignment_date"])
-train = train.sort_values("assignment_ts").reset_index(drop=True)
+train_df = train_df.sort_values(
+    ["assignment_ts", "lead_id"]
+).reset_index(drop=True)
 ```
 
-Идентификаторы `lead_id`, `user_id`, даты и target не используются как обычные признаки модели.
+Исходный порядок строк в `test.csv` сохраняется без изменений.
 
-### 2. Временная валидация
+Дополнительно проверяется:
 
-Случайное разбиение не используется, поскольку оно может давать слишком оптимистичную оценку на временных данных.
+- уникальность `lead_id` в train;
+- уникальность `lead_id` в test;
+- отсутствие пересечений `lead_id` между train и test.
 
-Вместо этого применяются rolling time folds:
+## Исключаемые признаки
 
-```text
-Fold 1: train 2026-04-07..2026-04-14, valid 2026-04-15..2026-04-16
-Fold 2: train 2026-04-07..2026-04-16, valid 2026-04-17..2026-04-18
-Fold 3: train 2026-04-07..2026-04-18, valid 2026-04-19..2026-04-20
-Fold 4: train 2026-04-07..2026-04-20, valid 2026-04-21..2026-04-22
-```
-
-Каждый validation-период находится строго позже соответствующей обучающей части.
-
-### 3. Baseline-модель
-
-Первая модель обучается только на готовых табличных признаках из `train.csv`.
-
-Категориальные признаки передаются CatBoost напрямую:
+Следующие колонки не передаются модели как обычные признаки:
 
 ```python
-cat_features = [
+DROP_COLS = [
+    "lead_id",
+    "user_id",
+    "assignment_ts",
+    "assignment_date",
+    "target",
+]
+```
+
+Причины:
+
+- `lead_id` является идентификатором обращения;
+- `user_id` не используется как переносимый пользовательский признак;
+- `assignment_ts` и `assignment_date` используются для временной логики;
+- `target` является целевой переменной.
+
+При этом отдельные производные временные признаки, например час и день недели, используются моделью.
+
+## Категориальные признаки
+
+Базовые категориальные признаки:
+
+```python
+CAT_FEATURES = [
     "lead_source",
     "call_center",
     "region",
@@ -109,272 +179,739 @@ cat_features = [
 ]
 ```
 
-CatBoost выбран по следующим причинам:
-
-- хорошо работает с табличными данными;
-- поддерживает категориальные признаки;
-- устойчив к пропускам;
-- не требует обязательного one-hot encoding;
-- подходит для нелинейных зависимостей и взаимодействий признаков.
-
-### 4. Признаки из `events.csv`
-
-События используются только в том случае, если они произошли до момента назначения обращения:
+После обработки событий к ним добавляются:
 
 ```python
-events_valid = events_merged[
-    events_merged["event_ts"] < events_merged["assignment_ts"]
+last_event_type
+last_ctx_seq
+```
+
+Категориальные признаки передаются в CatBoost напрямую, без ручного one-hot encoding.
+
+Пропущенные категориальные значения заменяются на специальные категории:
+
+```text
+__MISSING__
+__NO_EVENT__
+```
+
+## Baseline-модель
+
+В ноутбуке присутствует дополнительная baseline-модель, использующая только исходные табличные признаки.
+
+Baseline нужен для:
+
+- проверки корректности загрузки данных;
+- получения базового качества;
+- сравнения с моделью, использующей `events.csv`.
+
+Baseline обучается с временным holdout: последние даты используются как validation, более ранние даты — как train.
+
+Основной итоговый submission создаёт не baseline, а финальная enhanced-модель.
+
+Baseline-ячейку можно не запускать, если требуется только итоговый файл.
+
+## Признаки из `events.csv`
+
+Исторические события объединяются с обращениями по `lead_id`.
+
+Главное условие защиты от временной утечки:
+
+```python
+events_valid = events_valid.loc[
+    events_valid["event_ts"].notna()
+    & (events_valid["event_ts"] < events_valid["assignment_ts"])
 ].copy()
 ```
 
-Это предотвращает утечку информации из будущего.
+Используются только события, произошедшие строго раньше момента назначения обращения:
+
+```text
+event_ts < assignment_ts
+```
+
+События после назначения и события в тот же момент времени исключаются.
+
+## Типы событий
+
+В решении отдельно обрабатываются следующие типы событий:
+
+```python
+event_types = [
+    "item_view",
+    "search",
+    "favorite",
+    "chat_open",
+    "call_click",
+]
+```
+
+Для них рассчитываются общие количества, количества по временным окнам, recency и экспоненциально затухающая активность.
+
+## Общие event-признаки
 
 Для каждого `lead_id` рассчитываются:
 
+```text
+event_total_count
+event_type_nunique
+event_day_nunique
+event_price_log_mean
+event_price_log_std
+event_price_log_min
+event_price_log_max
+event_src_slot_mean
+event_src_slot_std
+event_src_slot_nunique
+event_ctx_seq_nunique
+event_hours_since_last
+event_hours_since_first
+```
+
+Эти признаки описывают:
+
+- общий объём истории;
+- разнообразие действий;
+- длительность истории;
+- статистики просмотренных цен;
+- разнообразие источников и контекста;
+- давность первого и последнего события.
+
+## Признаки последнего события
+
+Для самого последнего события до назначения сохраняются:
+
+```text
+last_event_type
+last_ctx_seq
+last_event_src_slot
+last_event_price_log
+last_ctx_seq_code
+```
+
+Также создаются бинарные признаки:
+
+```text
+last_event_is_item_view
+last_event_is_search
+last_event_is_favorite
+last_event_is_chat_open
+last_event_is_call_click
+```
+
+Это позволяет модели различать ситуации, когда последнее действие пользователя было обычным просмотром, поиском, добавлением в избранное, открытием чата или нажатием на звонок.
+
+## Временные окна событий
+
+Количество событий рассчитывается для нескольких временных окон перед назначением:
+
+```text
+6 часов
+24 часа
+72 часа
+7 дней
+```
+
+Окна задаются следующим образом:
+
+```python
+windows = [
+    (6, "6h"),
+    (24, "24h"),
+    (72, "72h"),
+    (168, "7d"),
+]
+```
+
+Для каждого окна создаётся:
+
 - общее количество событий;
-- количество уникальных типов событий;
-- средняя логарифмическая цена объектов;
-- время с момента последнего события;
-- количество событий каждого типа;
-- количество событий за последние 24 часа;
-- признак наличия исторических событий.
+- количество `item_view`;
+- количество `search`;
+- количество `favorite`;
+- количество `chat_open`;
+- количество `call_click`.
+
+Примеры:
+
+```text
+event_count_6h
+event_count_24h
+event_count_72h
+event_count_7d
+
+event_count_item_view_24h
+event_count_search_24h
+event_count_favorite_72h
+event_count_chat_open_7d
+event_count_call_click_6h
+```
+
+Также рассчитываются количества событий каждого типа за всю доступную историю:
+
+```text
+event_count_item_view_all
+event_count_search_all
+event_count_favorite_all
+event_count_chat_open_all
+event_count_call_click_all
+```
+
+## Recency-признаки
+
+Для каждого типа события рассчитывается время с последнего действия:
+
+```text
+event_hours_since_last_item_view
+event_hours_since_last_search
+event_hours_since_last_favorite
+event_hours_since_last_chat_open
+event_hours_since_last_call_click
+```
+
+Отдельно создаются:
+
+```text
+event_hours_since_last_missing
+event_log_hours_since_last
+event_history_span_hours
+```
+
+`event_log_hours_since_last` использует логарифмическое преобразование, чтобы уменьшить влияние очень больших значений.
+
+## Экспоненциально затухающая активность
+
+Недавние события могут быть важнее старых, поэтому дополнительно используется exponential decay.
+
+Для каждого события рассчитывается вес:
+
+```python
+weight = np.exp(
+    -hours_before_assign / tau_hours
+)
+```
+
+Используются два масштаба времени:
+
+```text
+tau = 24 часа
+tau = 168 часов
+```
 
 Примеры признаков:
 
 ```text
-total_events
-unique_event_types
-avg_item_price_log
-hours_since_last_event
-events_last_24h
-count_event_view
-count_event_search
-count_event_chat
+event_decay_item_view_24h
+event_decay_search_24h
+event_decay_favorite_24h
+
+event_decay_item_view_168h
+event_decay_chat_open_168h
+event_decay_call_click_168h
+```
+
+Чем ближе событие к моменту назначения, тем больший вклад оно вносит в значение признака.
+
+## Признак наличия событий
+
+Для обращений без исторических событий создаётся бинарный признак:
+
+```text
 has_events
 ```
 
-Точный набор колонок зависит от типов событий в исходном файле.
+Он равен:
 
-### 5. Trend-признаки
+```text
+1 — у обращения есть события до назначения;
+0 — исторических событий нет.
+```
 
-Дополнительно строятся признаки изменения активности пользователя.
+Отсутствие истории обрабатывается отдельно и не интерпретируется как обычное нулевое значение цены или recency.
+
+## Advanced-признаки
+
+После объединения исходных данных и событий создаются дополнительные признаки.
+
+### Циклические временные признаки
+
+Час назначения и день недели преобразуются через синус и косинус:
+
+```python
+assignment_hour_sin
+assignment_hour_cos
+assignment_weekday_sin
+assignment_weekday_cos
+```
+
+Это позволяет модели учитывать циклическую природу времени.
+
+Например, 23:00 и 00:00 оказываются близкими значениями, несмотря на разницу числовых кодов.
+
+## Trend-признаки
+
+Trend-признаки сравнивают среднюю интенсивность активности за короткое и длинное временное окно.
+
+Используется преобразование:
+
+```python
+short_rate = short_value / short_days
+long_rate = long_value / long_days
+
+trend = np.log(
+    (short_rate + 0.25)
+    / (long_rate + 0.25)
+).clip(-5, 5)
+```
+
+Сравниваются окна:
+
+```text
+1 день против 7 дней
+3 дня против 14 дней
+7 дней против 30 дней
+14 дней против 90 дней
+```
+
+Trend-признаки строятся для следующих групп активности:
+
+```text
+item_views
+item_favorites
+detail_expands
+photo_swipes
+seller_page_views
+search_views
+query_refinements
+similar_item_clicks
+saved_search_matches
+user_contacts
+chat_opens
+call_clicks
+leadgen_prev_assigned
+leadgen_prev_answered
+leadgen_prev_positive
+active_days_auto
+```
 
 Примеры:
 
-- отношение или логарифмическая разница активности за 1 день и 7 дней;
-- изменение количества добавлений в избранное;
-- разница между ценой текущего объекта и исторической средней ценой;
-- количество просмотров на день жизни аккаунта.
-
-Для защиты от деления на ноль и экстремальных выбросов используются устойчивые преобразования:
-
-```python
-trend = np.log1p(recent) - np.log1p(long_window / days)
-trend = trend.clip(-5, 5)
+```text
+trend_item_views_1d_vs_7d
+trend_item_favorites_3d_vs_14d
+trend_seller_page_views_7d_vs_30d
+trend_user_contacts_14d_vs_90d
 ```
 
-Для лидов без событий создаётся отдельный бинарный признак `has_events`. Отсутствующая история не интерпретируется как реальное нулевое значение цены.
+Положительное значение означает, что недавняя активность выше долгосрочного среднего.
 
-### 6. Подбор гиперпараметров
+Отрицательное значение означает снижение активности.
 
-Для подбора параметров применяется Optuna.
+## Funnel-признаки
 
-Оптимизируемая функция — средний Daily AP по rolling time folds.
+Дополнительно создаются сглаженные отношения между последовательными действиями пользователя.
 
-Подбираются:
+Используется преобразование:
+
+```python
+rate = np.log(
+    (numerator + 0.5)
+    / (denominator + 1.0)
+).clip(-7, 3)
+```
+
+Признаки рассчитываются для окон:
 
 ```text
-learning_rate
-depth
-l2_leaf_reg
-random_strength
-bagging_temperature
+7 дней
+30 дней
 ```
 
-Для воспроизводимости фиксируются seed CatBoost и Optuna.
+Используются следующие отношения:
 
-Пример создания study:
+```text
+item_favorites / item_views
+detail_expands / item_views
+photo_swipes / item_views
+seller_page_views / item_views
+query_refinements / search_views
+similar_item_clicks / search_views
+saved_search_matches / search_views
+user_contacts / item_views
+chat_opens / user_contacts
+call_clicks / user_contacts
+leadgen_prev_answered / leadgen_prev_assigned
+leadgen_prev_positive / leadgen_prev_assigned
+leadgen_prev_positive / leadgen_prev_answered
+```
+
+Примеры:
+
+```text
+rate_item_favorites_per_item_views_7d
+rate_user_contacts_per_item_views_30d
+rate_chat_opens_per_user_contacts_7d
+rate_leadgen_prev_positive_per_leadgen_prev_assigned_30d
+```
+
+Сглаживание защищает от деления на ноль и слишком больших значений на малом количестве наблюдений.
+
+## Ценовые признаки
+
+Цена текущего объекта сравнивается с историей пользователя.
+
+Создаются:
+
+```text
+price_diff_event_mean
+price_diff_event_min
+price_diff_event_max
+price_diff_last_event
+price_history_missing
+```
+
+Примеры логики:
 
 ```python
-sampler = optuna.samplers.TPESampler(seed=42)
-
-study = optuna.create_study(
-    direction="maximize",
-    sampler=sampler,
+price_diff_event_mean = (
+    current_item_price_log
+    - historical_event_price_log_mean
 )
 ```
 
-Число деревьев итоговой модели определяется по результатам early stopping на временных фолдах, а не задаётся произвольным большим значением.
+Это позволяет определить, отличается ли текущий объект по цене от объектов, с которыми пользователь взаимодействовал ранее.
 
-## Полученный локальный результат
+## Доли типов событий
 
-Лучший результат rolling time cross-validation:
-
-```text
-Rolling CV Daily AP: 0.632624
-```
-
-Результаты по временным фолдам:
+Для каждого типа события рассчитывается его доля в общей активности:
 
 ```text
-Fold 1: 0.581630
-Fold 2: 0.640966
-Fold 3: 0.674653
-Fold 4: 0.633246
+event_share_item_view_all
+event_share_search_all
+event_share_favorite_all
+event_share_chat_open_all
+event_share_call_click_all
 ```
 
-Лучшие найденные параметры:
+Также доли рассчитываются внутри временных окон:
 
 ```text
-learning_rate:       0.049248519849344134
-depth:               5
-l2_leaf_reg:         3.3000339465110766
-random_strength:     1.3822747149419152
-bagging_temperature: 1.700560535237379
-iterations:          841
+24 часа
+72 часа
+7 дней
 ```
 
-Это локальная оценка. Она не гарантирует такое же значение на скрытой тестовой выборке из-за возможного временного сдвига распределения данных.
+Примеры:
+
+```text
+event_share_item_view_24h
+event_share_favorite_72h
+event_share_chat_open_7d
+event_share_call_click_24h
+```
+
+Это помогает различать пользователей с одинаковым общим количеством событий, но разной структурой поведения.
+
+## Дополнительные интенсивности
+
+Создаются дополнительные признаки:
+
+```text
+event_density_per_day
+log_views_per_day_alive
+log_contacts_per_active_day
+feature_missing_count
+```
+
+Они описывают:
+
+- плотность событий относительно длины истории;
+- количество просмотров относительно возраста пользователя;
+- количество контактов относительно активных дней;
+- количество пропущенных исходных признаков.
+
+## Финальная модель
+
+Финальная модель обучается на всех доступных обучающих данных.
+
+Используемые параметры:
+
+```python
+final_model = CatBoostClassifier(
+    iterations=1000,
+    learning_rate=0.04,
+    depth=6,
+    l2_leaf_reg=8.0,
+    random_strength=0.8,
+    bagging_temperature=0.7,
+    loss_function="Logloss",
+    random_seed=42,
+    task_type="CPU",
+    thread_count=4,
+    border_count=32,
+    rsm=0.8,
+    allow_writing_files=False,
+    verbose=100,
+)
+```
+
+Параметры были зафиксированы после локальных экспериментов с временным разбиением.
+
+Финальная версия не запускает новый подбор гиперпараметров при каждом выполнении ноутбука. Это сокращает время работы и делает результат более воспроизводимым.
+
+## Почему используется CatBoost
+
+CatBoost выбран по следующим причинам:
+
+- хорошо работает с табличными данными;
+- поддерживает категориальные признаки напрямую;
+- устойчив к пропускам;
+- моделирует нелинейные зависимости;
+- автоматически учитывает взаимодействия признаков;
+- не требует обязательного one-hot encoding;
+- подходит для смешанных числовых и категориальных данных.
+
+## Ранжирование внутри дня
+
+После получения вероятностей CatBoost прогнозы переводятся в percentile rank отдельно внутри каждого `assignment_date`:
+
+```python
+day_rank_scores = (
+    rank_frame.groupby("assignment_date")["raw_score"]
+    .rank(method="average", pct=True)
+    .to_numpy()
+)
+```
+
+Это соответствует структуре метрики, которая рассчитывается отдельно для каждого дня.
+
+Итоговые значения `score` находятся в диапазоне от 0 до 1.
+
+При этом порядок объектов внутри каждого дня сохраняет порядок, заданный вероятностями модели.
+
+## Локальный результат
+
+Во время отдельной временной проверки enhanced-подход показал:
+
+```text
+Daily AP: примерно 0.6857
+```
+
+Для сравнения, предыдущий вариант на сопоставимом последнем временном периоде показывал около:
+
+```text
+Daily AP: 0.6332
+```
+
+Полученное улучшение связано прежде всего с:
+
+- расширенными event-признаками;
+- раздельными временными окнами;
+- recency по типам событий;
+- признаками последнего события;
+- exponential decay;
+- trend-признаками;
+- funnel-признаками;
+- ценовыми сравнениями.
+
+Локальное значение не гарантирует аналогичный результат на скрытой тестовой выборке из-за возможного временного сдвига распределения данных.
 
 ## Создаваемые submission-файлы
 
-Ноутбук создаёт три основных файла:
+Основной файл:
+
+```text
+submission_enhanced.csv
+```
+
+При запуске optional baseline-ячейки дополнительно может быть создан:
 
 ```text
 catboost_baseline_submission.csv
-catboost_events_submission.csv
-catboost_optuna_trends_submission.csv
 ```
 
-Назначение файлов:
-
-- `catboost_baseline_submission.csv` — CatBoost только на готовых табличных признаках;
-- `catboost_events_submission.csv` — модель с признаками из `events.csv`;
-- `catboost_optuna_trends_submission.csv` — итоговая модель с events-признаками, trend-признаками и параметрами Optuna.
-
-Основной файл для отправки:
+Для отправки на платформу используется:
 
 ```text
-catboost_optuna_trends_submission.csv
+submission_enhanced.csv
 ```
-
-## Дополнительный rank blend
-
-Поскольку метрика зависит от порядка объектов, можно дополнительно проверить ранговый ансамбль итоговой модели и baseline.
-
-```python
-import pandas as pd
-
-optuna_sub = pd.read_csv("catboost_optuna_trends_submission.csv")
-baseline_sub = pd.read_csv("catboost_baseline_submission.csv")
-
-assert optuna_sub["lead_id"].equals(baseline_sub["lead_id"])
-
-optuna_rank = optuna_sub["score"].rank(method="average", pct=True)
-baseline_rank = baseline_sub["score"].rank(method="average", pct=True)
-
-blend_submission = pd.DataFrame({
-    "lead_id": optuna_sub["lead_id"],
-    "score": 0.8 * optuna_rank + 0.2 * baseline_rank,
-})
-
-blend_submission.to_csv(
-    "catboost_rank_blend_80_20.csv",
-    index=False,
-)
-```
-
-Этот вариант является дополнительным экспериментом. Его качество необходимо проверять отдельно на платформе или на локальной временной валидации.
 
 ## Проверки итогового файла
 
-Перед сохранением submission выполняются проверки:
+Перед сохранением выполняются проверки:
 
 ```python
 assert list(submission.columns) == ["lead_id", "score"]
-assert len(submission) == len(test)
-assert submission["lead_id"].tolist() == test["lead_id"].tolist()
+assert len(submission) == len(test_frame)
 assert submission["lead_id"].is_unique
+assert submission["lead_id"].tolist() == test_frame["lead_id"].tolist()
 assert np.isfinite(submission["score"]).all()
-assert submission["score"].between(0, 1).all()
+assert submission["score"].between(0.0, 1.0).all()
 ```
 
-Это гарантирует:
+Эти проверки гарантируют:
 
-- правильное количество строк;
 - правильные названия колонок;
-- сохранение исходного порядка `test.csv`;
+- правильное количество строк;
 - отсутствие дубликатов `lead_id`;
-- отсутствие `NaN` и бесконечных значений;
-- нахождение всех score в диапазоне от 0 до 1.
+- сохранение исходного порядка `test.csv`;
+- отсутствие `NaN`;
+- отсутствие бесконечных значений;
+- нахождение всех `score` в диапазоне от 0 до 1.
 
 ## Как запустить решение
 
-### Вариант 1. Jupyter Notebook
+### 1. Подготовить данные
 
-Открыть:
+Поместить файлы:
 
 ```text
-corrected_lead_solution.ipynb
+train.csv
+test.csv
+events.csv
 ```
 
-Запустить все ячейки строго сверху вниз.
+в папку:
 
-### Вариант 2. Python-скрипт
+```text
+data/
+```
+
+### 2. Открыть ноутбук
 
 ```bash
-python corrected_lead_solution.py
+jupyter notebook corrected_lead_solution.ipynb
 ```
 
-Запуск необходимо выполнять из корня проекта, в котором находится папка `data`.
+### 3. Перезапустить ядро
 
-## Быстрый тестовый запуск Optuna
+Перед запуском рекомендуется выполнить:
 
-Для проверки работоспособности кода без долгого ожидания:
-
-```python
-N_TRIALS = 3
-N_FOLDS = 2
+```text
+Kernel → Restart Kernel
 ```
 
-Для полного запуска:
+### 4. Запустить необходимые ячейки
 
-```python
-N_TRIALS = 20
-N_FOLDS = 4
+Если считать только кодовые ячейки:
+
+```text
+1 → 3 → 5
 ```
 
-На CPU полный подбор может занимать от нескольких десятков минут до нескольких часов в зависимости от процессора, настроек CatBoost и эффективности early stopping.
+Если считать все ячейки, включая Markdown:
+
+```text
+2 → 6 → 10
+```
+
+Назначение этих ячеек:
+
+```text
+1. Загрузка train/test и определение общих функций.
+2. Построение расширенных признаков из events.csv.
+3. Создание advanced-признаков, обучение модели и сохранение submission.
+```
+
+Baseline-ячейку запускать необязательно.
+
+Также можно выполнить все ячейки сверху вниз. В таком случае дополнительно обучится baseline-модель.
+
+## Результат выполнения
+
+После завершения финальной ячейки появится сообщение:
+
+```text
+Готов файл submission_enhanced.csv
+```
+
+Итоговый файл будет сохранён в корне проекта:
+
+```text
+project/
+└── submission_enhanced.csv
+```
 
 ## Воспроизводимость
 
-Для воспроизводимости используются:
+Для воспроизводимости используется:
 
 ```python
 RANDOM_SEED = 42
 ```
 
-Seed фиксируется в:
+Seed фиксируется в CatBoost:
 
-- NumPy;
-- CatBoost;
-- Optuna `TPESampler`.
+```python
+random_seed=RANDOM_SEED
+```
 
-Также отключается запись служебных файлов CatBoost:
+Также используются фиксированные:
+
+- параметры модели;
+- порядок обработки строк;
+- список признаков;
+- правила заполнения пропусков;
+- правила построения event-признаков;
+- percentile ranking внутри дня.
+
+Запись служебной директории CatBoost отключена:
 
 ```python
 allow_writing_files=False
 ```
 
+## Защита от утечек
+
+Решение не использует:
+
+- события после момента назначения;
+- события в момент назначения;
+- `target` как входной признак;
+- `lead_id` как входной признак;
+- `user_id` как входной признак;
+- данные скрытой тестовой разметки;
+- внешние API;
+- ручную разметку test;
+- восстановление target по идентификаторам.
+
+Ключевое условие:
+
+```python
+event_ts < assignment_ts
+```
+
 ## Ограничения решения
 
-- Подбор параметров проводится на ограниченном числе trials.
-- Скрытая тестовая выборка может отличаться от последних обучающих дат.
-- Event-признаки агрегируются на уровне `lead_id`; дополнительные пользовательские временные агрегации могут улучшить результат.
-- Rank blend не считается гарантированно лучшим без отдельной валидации.
-- Значение локального CV не является результатом на закрытом leaderboard.
-
+- Финальные параметры модели зафиксированы и не подбираются заново при каждом запуске.
+- Локальная временная проверка может отличаться от скрытого leaderboard.
+- Распределение данных в test может отличаться от последних дат train.
+- Модель использует агрегированные события, а не полную последовательную модель поведения.
+- Percentile rank сохраняет порядок, но не является откалиброванной вероятностью.
+- Дополнительный ансамбль моделей в финальной версии не используется.
 
 ## Итог
 
-Решение соблюдает временной порядок данных, исключает события после назначения обращения, использует официальную логику Daily Average Precision и формирует воспроизводимый submission в требуемом формате.
+Решение:
+
+- соблюдает временной порядок данных;
+- исключает события после назначения;
+- использует официальную логику Daily Average Precision;
+- строит расширенные признаки из `events.csv`;
+- учитывает recency и структуру событий;
+- использует trend- и funnel-признаки;
+- ранжирует прогнозы отдельно внутри каждого дня;
+- сохраняет результат в требуемом формате;
+- формирует воспроизводимый файл `submission_enhanced.csv`.
+
+Основной файл решения:
+
+```text
+corrected_lead_solution.ipynb
+```
+
+Основной файл для отправки:
+
+```text
+submission_enhanced.csv
+```
